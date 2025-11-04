@@ -1,6 +1,0 @@
-subject: sub_10_LeeSH
-percentile threshold: 99.5
-dice: 0.365906
-intersection voxels: 28159.0
-tof vessel voxels:  76851.0
-mgre vessel voxels: 77063.0
