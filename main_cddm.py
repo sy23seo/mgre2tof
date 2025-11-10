@@ -42,7 +42,7 @@ from denoising_diffusion_pytorch.utils_1 import (
 def main():
 
     # ============================ 2) 전역 설정(모드/데이터) ============================
-    STAGE = "pretrain"  # "pretrain" | "control"-----------------------------------------------------------------------------------------------------------------------------------
+    STAGE = "control"  # "pretrain" | "control"-----------------------------------------------------------------------------------------------------------------------------------
 
     pretraining_tof_h5 = "/SSD5_8TB/Yeon/data/merged_250916.h5"
     paired_tof_h5      = "/SSD5_8TB/Yeon/data/registered_all_subjects_m1to1.h5"

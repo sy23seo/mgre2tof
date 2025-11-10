@@ -1148,7 +1148,8 @@ class GaussianDiffusion(Module):
         base_loss = base_loss * extract(self.loss_weight, t, base_loss.shape)
         base_loss = base_loss.mean()
 
-        # MIP 비활성 시에는 기본 손실만 반환# ---------------------------------------------------------------------------2025-10-09 MIP loss를 pbar로 나타내기 Seo 👇
+        # MIP 비활성 시에는 기본 손실만 반환
+        # ---------------------------------------------------------------------------2025-10-09 MIP loss를 pbar로 나타내기 Seo 👇
         # if getattr(self, 'mip_loss', None) is None or getattr(self, 'awl', None) is None:
         #     return base_loss
         # ----- base_loss만 쓰는 경로 ----- 원래 위에 2줄이였는데 MIP loss 도 pbar로 나타내려고 아래 줄로 바뀜
@@ -1156,7 +1157,8 @@ class GaussianDiffusion(Module):
             if return_stats:
                 stats = {'base': float(base_loss.detach().item()), 'mip': None, 'total': float(base_loss.detach().item())}
                 return base_loss, stats
-            return base_loss# ---------------------------------------------------------------------------------------2025-10-09 MIP loss를 pbar로 나타내기 Seo 👆
+            return base_loss
+        # ---------------------------------------------------------------------------------------2025-10-09 MIP loss를 pbar로 나타내기 Seo 👆
 
         ## pred_noise, pred_x0, pred_v 공통: 모델 출력 → x0_hat 구하기, no grad를 통해서 grad 연결 차단
         if self.objective in ('pred_noise', 'pred_v'):
@@ -1184,6 +1186,18 @@ class GaussianDiffusion(Module):
         # MIP loss
         mip_loss = self.mip_loss(x0_hat, x_start)
 
+        # ===================== 여기부터 추가: 혈관가중 L2 =====================
+        # GT TOF가 밝은 곳일수록 중요하게 보도록 weight map 생성
+        with torch.no_grad():
+            tau   = 0.15   # 밝기 기준 (데이터 보고 조절)
+            sharp = 10.0   # 경사
+            m = torch.sigmoid((x_start - tau) * sharp)    # (B, C, H, W), 혈관일수록 1에 가까움
+
+        lambda_vessel = 3.0
+        weight_map = 1.0 + lambda_vessel * m
+        vessel_weighted_l2 = (weight_map * (x0_hat - x_start).pow(2)).mean()
+        # ================================================================
+
         # 5) 결합
         # (a) 간단 가중합
         # lam_mip = getattr(self, 'lambda_mip', 1.0)   # 하이퍼파라미터
@@ -1196,7 +1210,7 @@ class GaussianDiffusion(Module):
         # sigma_t = extract(self.some_sigma_sched, t, x.shape).mean() # sigma_t는 텐서 스칼라로(브로드캐스트/shape 이슈 방지). timestep별 버퍼에서 추출 후 평균(이러면 배치 8만큼 ).
         # total_loss = self.awl(awl_losses, sigma_t=sigma_t)
         ### 그냥 아래 꺼 말고 위에 두줄쓰는게 속편함
-        #변경된 부분: 배치 평균이 아닌 샘플별 sigma_t (δ_t) 벡터 사용 ⬇ 👇  
+        # 변경된 부분: 배치 평균이 아닌 샘플별 sigma_t (δ_t) 벡터 사용 ⬇ 👇  
         B = x.size(0)       # 샘플별 sigma (δ_t) 벡터 [B]
         sigma_vec = extract(self.some_sigma_sched, t, (B, 1, 1, 1)).squeeze(-1).squeeze(-1).squeeze(-1)  # [B]
 
@@ -1215,19 +1229,25 @@ class GaussianDiffusion(Module):
         total_loss = total_per.mean()  # 최종 스칼라
         # ---------------------------------------------------------------------------2025-10-09 MIP loss를 배치마다 다른 delta t로 적용하기 mean 않하고 Seo 👆
 
+        # ★ 여기서 vessel-weighted L2를 작게 더해줌
+        lambda_vessel_loss = 0.2  # 이건 네가 튜닝
+        total_loss = total_loss + lambda_vessel_loss * vessel_weighted_l2
 
-        # return total_loss # ---------------------------------------------------------------------------2025-10-09 MIP loss를 pbar로 나타내기 Seo 👇
+        # return total_loss 
+        # ---------------------------------------------------------------------------2025-10-09 MIP loss를 pbar로 나타내기 Seo 👇
         if return_stats:
             stats = {
                 'base':  float(base_loss.detach().item()),
                 'mip':   float(mip_loss.detach().item()),
-                'total': float(total_loss.detach().item())
+                'total': float(total_loss.detach().item()),
+                # 원하면 모니터링용으로 이것도 넣어둘 수 있음
+                'vessel_l2': float(vessel_weighted_l2.detach().item())
             }
             return total_loss, stats
 
-        return total_loss# ---------------------------------------------------------------------------2025-10-09 MIP loss를 pbar로 나타내기 Seo 👆
+        return total_loss
+        # ---------------------------------------------------------------------------2025-10-09 MIP loss를 pbar로 나타내기 Seo 👆
         # ===================== 👆👆👆 새 옵션 추가 👆👆👆 =====================
-
 
     # -------------------------------------------------20251010 수정 controlnet update (cond 전달 경로 추가)
     def forward(self, img, *args, cond=None, **kwargs):

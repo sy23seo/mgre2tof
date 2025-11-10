@@ -55,6 +55,34 @@ if __name__ == "__main__":
 
 
 
+#%%
+from pathlib import Path
+import h5py
+
+pretraining_tof_h5 = Path("/SSD5_8TB/Yeon/data/merged_250916.h5")
+paired_tof_h5      = Path("/SSD5_8TB/Yeon/data/registered_all_subjects_m1to1.h5")
+
+
+def inspect_h5(path: Path):
+    print(f"\n=== {path} ===")
+    with h5py.File(path, "r") as f:
+        def _print_group(g, prefix=""):
+            for k, v in g.items():
+                if isinstance(v, h5py.Dataset):
+                    print(f"{prefix}/{k}: shape={v.shape}, dtype={v.dtype}")
+                else:
+                    print(f"{prefix}/{k}/ (group)")
+                    _print_group(v, prefix + "/" + k)
+
+        _print_group(f)
+
+
+if __name__ == "__main__":
+    inspect_h5(pretraining_tof_h5)
+    inspect_h5(paired_tof_h5)
+
+
+
 
 
 
