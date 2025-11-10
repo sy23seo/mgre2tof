@@ -882,7 +882,7 @@ class GaussianDiffusion(Module):
             self.mip_loss.num_slice = self.channels
 
         # 결합 손실 2개(base, mip)에 맞춰 파라미터 개수 지정
-        self.awl = AutomaticWeightedLoss(num=2).to(self.device)
+        self.awl = AutomaticWeightedLoss(num=4).to(self.device)
 
         # timestep별 sigma 스케줄(여기서는 0으로 초기화 – 필요 시 바꾸면 됨)
         # sigma_sched = torch.zeros(self.num_timesteps, device=self.device, dtype=torch.float32) # sigma_sched = 항상 0으로 되어있는 상태임 2025-10-09
@@ -1190,13 +1190,50 @@ class GaussianDiffusion(Module):
         # GT TOF가 밝은 곳일수록 중요하게 보도록 weight map 생성
         with torch.no_grad():
             tau   = 0.15   # 밝기 기준 (데이터 보고 조절)
-            sharp = 10.0   # 경사
+            sharp = 5.0   # 경사
             m = torch.sigmoid((x_start - tau) * sharp)    # (B, C, H, W), 혈관일수록 1에 가까움
 
         lambda_vessel = 3.0
         weight_map = 1.0 + lambda_vessel * m
         vessel_weighted_l2 = (weight_map * (x0_hat - x_start).pow(2)).mean()
         # ================================================================
+
+        # ===================== Edge-aware 손실 추가 =====================
+        def sobel_filter(x):
+            # x: (B, C, H, W)  — C채널 각각에 동일 Sobel 적용
+            B, C, H, W = x.shape
+
+            kx = torch.tensor(
+                [[[-1, 0, 1],
+                  [-2, 0, 2],
+                  [-1, 0, 1]]],
+                dtype=x.dtype,
+                device=x.device
+            ).unsqueeze(0)          # [1,1,3,3]
+
+            ky = torch.tensor(
+                [[[-1, -2, -1],
+                  [ 0,  0,  0],
+                  [ 1,  2,  1]]],
+                dtype=x.dtype,
+                device=x.device
+            ).unsqueeze(0)          # [1,1,3,3]
+
+            # 각 채널별로 같은 커널을 쓰기 위해 C개로 expand 후 groups=C 사용
+            kx = kx.expand(C, 1, 3, 3)     # [C,1,3,3]
+            ky = ky.expand(C, 1, 3, 3)     # [C,1,3,3]
+
+            gx = F.conv2d(x, kx, padding=1, groups=C)   # (B,C,H,W)
+            gy = F.conv2d(x, ky, padding=1, groups=C)   # (B,C,H,W)
+
+            return torch.sqrt(gx ** 2 + gy ** 2 + 1e-8)
+
+        with torch.no_grad():
+            gt_edge = sobel_filter(x_start)
+        pred_edge = sobel_filter(x0_hat)
+        loss_edge = F.l1_loss(pred_edge, gt_edge)
+        # ================================================================
+
 
         # 5) 결합
         # (a) 간단 가중합
@@ -1215,39 +1252,56 @@ class GaussianDiffusion(Module):
         sigma_vec = extract(self.some_sigma_sched, t, (B, 1, 1, 1)).squeeze(-1).squeeze(-1).squeeze(-1)  # [B]
 
         # AWL 파라미터로 조합을 호출부에서 직접 계산 (AWL 코드는 손대지 않음)
-        theta0_sq = self.awl.params[0] ** 2
-        theta1_sq = self.awl.params[1] ** 2
+        theta0_sq = self.awl.params[0] ** 2   # base용
+        theta1_sq = self.awl.params[1] ** 2   # mip용
+        theta2_sq = self.awl.params[2] ** 2   # vessel-weighted용
+        theta3_sq = self.awl.params[3] ** 2   # edge
 
         # base_loss, mip_loss는 현재 스칼라임(배치 평균). 
         # base는 스칼라 분모, MIP는 샘플별 분모를 사용 → per-sample 가중 근사
-        adj_base = theta0_sq                              # scalar
-        adj_mip  = theta1_sq + sigma_vec                  # [B]
+        adj_base = theta0_sq                           # scalar
+        adj_mip  = theta1_sq + sigma_vec               # [B]  ← 원래 네가 per-sample로 하던 거 유지
+        adj_vw   = theta2_sq                           # scalar (필요하면 여기도 per-sample로 바꿀 수 있음)
 
-        total_per = (0.5 / adj_base) * base_loss + torch.log(1 + adj_base) \
-                + (0.5 / adj_mip)  * mip_loss  + torch.log(1 + adj_mip)   # [B]
+        # ----- 여기부터 수정: edge 쪽에 t-기반 sigmoid 스케줄 반영 -----
+        # t를 0~1로 정규화해서 초기에는 edge 약하게, 후반에는 강하게
+        T = float(self.num_timesteps)                  # 예: 1000
+        t_norm = t.float().view(-1) / (T - 1.0)        # [B], 0~1 범위
 
-        total_loss = total_per.mean()  # 최종 스칼라
+        k      = 8.0   # sigmoid 기울기 (클수록 후반에 급격히 켜짐)
+        center = 0.5   # 중간쯤에서 전환
+        edge_phase = torch.sigmoid((t_norm - center) * k)   # 초반≈0, 후반≈1  → [B]
+
+        alpha_edge = 1.0
+        # early: edge_phase≈0 → (1 - edge_phase)≈1 → adj_edge 커짐 → edge term 약하게
+        # late:  edge_phase≈1 → (1 - edge_phase)≈0 → adj_edge≈theta3_sq → edge term 강하게
+        adj_edge = theta3_sq + alpha_edge * (1.0 - edge_phase)   # [B]
+        # ------------------------------------------------------
+
+        total_per = (
+            (0.5 / adj_base) * base_loss + torch.log(1 + adj_base)
+            + (0.5 / adj_mip)  * mip_loss          + torch.log(1 + adj_mip)
+            + (0.5 / adj_vw)   * vessel_weighted_l2 + torch.log(1 + adj_vw)
+            + (0.5 / adj_edge) * loss_edge         + torch.log(1 + adj_edge)
+        )
+
+        total_loss = total_per.mean()
         # ---------------------------------------------------------------------------2025-10-09 MIP loss를 배치마다 다른 delta t로 적용하기 mean 않하고 Seo 👆
 
-        # ★ 여기서 vessel-weighted L2를 작게 더해줌
-        lambda_vessel_loss = 0.2  # 이건 네가 튜닝
-        total_loss = total_loss + lambda_vessel_loss * vessel_weighted_l2
-
-        # return total_loss 
-        # ---------------------------------------------------------------------------2025-10-09 MIP loss를 pbar로 나타내기 Seo 👇
         if return_stats:
             stats = {
-                'base':  float(base_loss.detach().item()),
-                'mip':   float(mip_loss.detach().item()),
-                'total': float(total_loss.detach().item()),
-                # 원하면 모니터링용으로 이것도 넣어둘 수 있음
-                'vessel_l2': float(vessel_weighted_l2.detach().item())
+                'base':        float(base_loss.detach().item()),
+                'mip':         float(mip_loss.detach().item()),
+                'vessel_l2':   float(vessel_weighted_l2.detach().item()),
+                'edge':        float(loss_edge.detach().item()),
+                'total':       float(total_loss.detach().item()),
             }
             return total_loss, stats
 
         return total_loss
         # ---------------------------------------------------------------------------2025-10-09 MIP loss를 pbar로 나타내기 Seo 👆
         # ===================== 👆👆👆 새 옵션 추가 👆👆👆 =====================
+
 
     # -------------------------------------------------20251010 수정 controlnet update (cond 전달 경로 추가)
     def forward(self, img, *args, cond=None, **kwargs):
@@ -2411,6 +2465,44 @@ class Trainer:
 
                 self.step += 1
 
+                # # 진행바/로그는 main 프로세스에서만
+                # if accelerator.is_main_process:
+                #     # 1) 매 스텝 진행률 증가
+                #     pbar.update(1)
+
+                #     # 2) 통계 수집 스텝에서만 값 계산 + TB 로깅
+                #     if collect_stats and step_loss_tensor is not None:
+                #         def _to_float(x):
+                #             if x is None:
+                #                 return None
+                #             return float(x.item()) if hasattr(x, "item") else float(x)
+
+                #         total_loss = _to_float(step_loss_tensor)
+                #         pbar.set_description(f"loss: {total_loss:.4f}")
+
+                #         base_v = mip_v = tot_v = None
+                #         if 'last_stats' in locals() and last_stats is not None:
+                #             base_v = _to_float(last_stats.get("base"))
+                #             mip_v  = _to_float(last_stats.get("mip"))
+                #             tot_v  = _to_float(last_stats.get("total"))
+
+                #             if mip_v is None:
+                #                 pbar.set_postfix_str(f"base={base_v:.4f} total={tot_v:.4f}")
+                #             else:
+                #                 pbar.set_postfix_str(f"base={base_v:.4f} mip={mip_v:.4f} total={tot_v:.4f}")
+
+                #         if self.tb is not None:
+                #             self.tb.add_scalar("train/loss",  total_loss, global_step=self.step)
+                #             if base_v is not None:
+                #                 self.tb.add_scalar("train/base",  base_v,  global_step=self.step)
+                #             if mip_v is not None:
+                #                 self.tb.add_scalar("train/mip",   mip_v,   global_step=self.step)
+                #             if tot_v is not None:
+                #                 self.tb.add_scalar("train/total", tot_v,   global_step=self.step)
+
+                #     # 3) 즉시 출력 반영(옵션)
+                #     pbar.refresh()
+
                 # 진행바/로그는 main 프로세스에서만
                 if accelerator.is_main_process:
                     # 1) 매 스텝 진행률 증가
@@ -2427,27 +2519,50 @@ class Trainer:
                         pbar.set_description(f"loss: {total_loss:.4f}")
 
                         base_v = mip_v = tot_v = None
-                        if 'last_stats' in locals() and last_stats is not None:
-                            base_v = _to_float(last_stats.get("base"))
-                            mip_v  = _to_float(last_stats.get("mip"))
-                            tot_v  = _to_float(last_stats.get("total"))
+                        vwl2_v = edge_v = None   # 👈 추가
 
+                        if 'last_stats' in locals() and last_stats is not None:
+                            base_v   = _to_float(last_stats.get("base"))
+                            mip_v    = _to_float(last_stats.get("mip"))
+                            vwl2_v   = _to_float(last_stats.get("vessel_l2"))  # 👈 추가
+                            edge_v   = _to_float(last_stats.get("edge"))       # 👈 추가
+                            tot_v    = _to_float(last_stats.get("total"))
+
+                            # 진행바 postfix 문자열 구성
                             if mip_v is None:
-                                pbar.set_postfix_str(f"base={base_v:.4f} total={tot_v:.4f}")
+                                # MIP 비활성일 때
+                                pbar.set_postfix_str(
+                                    f"base={base_v:.4f} "
+                                    f"vwl2={vwl2_v:.4f} "
+                                    f"edge={edge_v:.4f} "
+                                    f"total={tot_v:.4f}"
+                                )
                             else:
-                                pbar.set_postfix_str(f"base={base_v:.4f} mip={mip_v:.4f} total={tot_v:.4f}")
+                                # MIP 활성일 때
+                                pbar.set_postfix_str(
+                                    f"base={base_v:.4f} "
+                                    f"mip={mip_v:.4f} "
+                                    f"vwl2={vwl2_v:.4f} "
+                                    f"edge={edge_v:.4f} "
+                                    f"total={tot_v:.4f}"
+                                )
 
                         if self.tb is not None:
                             self.tb.add_scalar("train/loss",  total_loss, global_step=self.step)
                             if base_v is not None:
-                                self.tb.add_scalar("train/base",  base_v,  global_step=self.step)
+                                self.tb.add_scalar("train/base",      base_v,  global_step=self.step)
                             if mip_v is not None:
-                                self.tb.add_scalar("train/mip",   mip_v,   global_step=self.step)
+                                self.tb.add_scalar("train/mip",       mip_v,   global_step=self.step)
+                            if vwl2_v is not None:
+                                self.tb.add_scalar("train/vessel_l2", vwl2_v,  global_step=self.step)  # 👈 추가
+                            if edge_v is not None:
+                                self.tb.add_scalar("train/edge",      edge_v,  global_step=self.step)  # 👈 추가
                             if tot_v is not None:
-                                self.tb.add_scalar("train/total", tot_v,   global_step=self.step)
+                                self.tb.add_scalar("train/total",     tot_v,   global_step=self.step)
 
                     # 3) 즉시 출력 반영(옵션)
                     pbar.refresh()
+
 
                 # EMA는 모든 프로세스에서 업데이트
                 if hasattr(self, "ema") and self.ema is not None:

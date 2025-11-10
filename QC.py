@@ -1,6 +1,7 @@
 #%%
 import numpy as np
 from pathlib import Path
+import torch  # 👈 추가
 
 # utils_1에서 우리가 쓸 함수들만 가져옴
 from denoising_diffusion_pytorch.utils_1 import (
@@ -10,7 +11,7 @@ from denoising_diffusion_pytorch.utils_1 import (
 
 def main():
     # 1) 네 볼륨 NPY 경로
-    npy_path = "/home/milab/SSD5_8TB/Yeon/code/denoising-diffusion-pytorch2/inputs_center_volume.npy"
+    npy_path = "/home/milab/SSD5_8TB/Yeon/code/mgre2tof/inputs_center_volume.npy"
 
     # 2) 저장할 폴더
     out_dir = Path("./debug_vis")
@@ -31,7 +32,6 @@ def main():
         vol=vol,
         out_path=center_png,
         title_prefix="Input(center)",
-        # q_low, q_high 기본값(0.01, 0.99) 이미 utils_1에서 쓰는 값이랑 동일하게 전달 가능
         q_low=0.01,
         q_high=0.99,
     )
@@ -45,6 +45,40 @@ def main():
         title_prefix="Input(center)",
     )
     print(f"[SAVE] MIP views -> {mip_png}")
+
+    # 6) ----- 여기서부터 'm' 시각화 -----
+    # vol: (Z, H, W) numpy -> torch로 바꾸고 혈관 강조 마스크 만들기
+    vol_t = torch.from_numpy(vol).float()  # (Z, H, W)
+
+    # 파라미터는 학습 코드에서 썼던 거랑 맞춰줌
+    tau = 0.15 # 0.15
+    sharp = 5.0
+
+    with torch.no_grad():
+        # (vol - tau) * sharp 에 sigmoid → 밝을수록 1에 가까운 마스크
+        m_t = torch.sigmoid((vol_t - tau) * sharp)  # (Z, H, W)
+
+    # 다시 numpy로 변환
+    m = m_t.cpu().numpy().astype(np.float32)
+
+    # center/mip 둘 다 저장해서 실제 어떤 식으로 threshold 되는지 확인
+    m_center_png = out_dir / "m_mask_center_views.png"
+    _save_center_slice_subplot(
+        vol=m,
+        out_path=m_center_png,
+        title_prefix="m (sigmoid mask)",
+        q_low=0.0,   # 이미 0~1 범위라 0,1로 둬도 됨
+        q_high=1.0,
+    )
+    print(f"[SAVE] m center views -> {m_center_png}")
+
+    m_mip_png = out_dir / "m_mask_mip_views.png"
+    _save_mip_subplot(
+        vol=m,
+        out_path=m_mip_png,
+        title_prefix="m (sigmoid mask)",
+    )
+    print(f"[SAVE] m MIP views -> {m_mip_png}")
 
 if __name__ == "__main__":
     main()
@@ -85,6 +119,98 @@ if __name__ == "__main__":
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#%%
+import torch
+import matplotlib.pyplot as plt
+
+def plot_loss_influence(diffusion,
+                        k=8.0,
+                        center=0.5,
+                        alpha_edge=1.0,
+                        save_path=None):
+    """
+    diffusion: GaussianDiffusion 인스턴스 (self.some_sigma_sched, self.awl.params 사용)
+    """
+
+    device = diffusion.device
+    T = diffusion.num_timesteps  # 보통 1000
+
+    # t, delta_t(=some_sigma_sched) 스케줄 ─ 훈련 때 쓰는 것 그대로 사용
+    t = torch.arange(T, device=device, dtype=torch.float32)
+    delta_t = diffusion.some_sigma_sched[:T].float()          # [T]  δ_t 스케줄:contentReference[oaicite:0]{index=0}
+
+    # AWL 파라미터 θ^2 (base, mip, vessel, edge) 4개 사용:contentReference[oaicite:1]{index=1}
+    theta_sq = (diffusion.awl.params ** 2).detach().to(device)
+    theta0_sq, theta1_sq, theta2_sq, theta3_sq = theta_sq
+
+    # ----- 조합식에서 쓰는 adj_*를 t별로 다시 계산 -----
+    adj_base  = torch.full_like(t, theta0_sq)          # [T]
+    adj_mip   = theta1_sq + delta_t                    # [T]
+    adj_vw    = torch.full_like(t, theta2_sq)          # [T]
+
+    # edge 쪽 t-기반 sigmoid 스케줄
+    t_norm = t / (T - 1.0)                             # 0~1
+    edge_phase = torch.sigmoid((t_norm - center) * k)  # [T]
+    adj_edge = theta3_sq + alpha_edge * (1.0 - edge_phase)  # [T]
+
+    # ----- “영향력” = 0.5/adj_* 를 정규화해서 share 로 보기 -----
+    w_base  = 0.5 / adj_base
+    w_mip   = 0.5 / adj_mip
+    w_vw    = 0.5 / adj_vw
+    w_edge  = 0.5 / adj_edge
+
+    W = torch.stack([w_base, w_mip, w_vw, w_edge], dim=0)  # [4,T]
+    W_norm = W / W.sum(dim=0, keepdim=True)                # timestep별 normalize
+
+    t_np = t.cpu().numpy()
+    W_np = W_norm.cpu().numpy()
+
+    plt.figure(figsize=(10, 4))
+    plt.plot(t_np, W_np[0], label=f"Base share (θ0²={theta0_sq.item():.3f})")
+    plt.plot(t_np, W_np[1], label=f"MIP share (θ1²={theta1_sq.item():.3f})")
+    plt.plot(t_np, W_np[2], label=f"Vessel share (θ2²={theta2_sq.item():.3f})")
+    plt.plot(t_np, W_np[3], label=f"Edge share (θ3²={theta3_sq.item():.3f})")
+
+    plt.xlabel("t")
+    plt.ylabel("normalized share")
+    plt.title("Normalized per-t loss influence (base / MIP / vessel / edge)")
+    plt.grid(True, alpha=0.3)
+    plt.legend(loc="best")
+
+    if save_path is not None:
+        plt.savefig(save_path, dpi=200, bbox_inches="tight")
+    else:
+        plt.show()
+
+
+if __name__ == "__main__":
+    
 
 
 

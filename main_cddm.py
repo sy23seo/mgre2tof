@@ -13,7 +13,8 @@ import numpy as np
 import math
 import json, csv
 
-os.environ["CUDA_VISIBLE_DEVICES"] = str(5)
+os.environ["CUDA_VISIBLE_DEVICES"] = str(7)
+print("Using CUDA devices:", os.environ["CUDA_VISIBLE_DEVICES"])
 
 from denoising_diffusion_pytorch.denoising_diffusion_pytorch_SEO_cldm_1 import (
     Unet,
@@ -42,9 +43,9 @@ from denoising_diffusion_pytorch.utils_1 import (
 def main():
 
     # ============================ 2) 전역 설정(모드/데이터) ============================
-    STAGE = "control"  # "pretrain" | "control"-----------------------------------------------------------------------------------------------------------------------------------
+    STAGE = "pretrain"  # "pretrain" | "control"-----------------------------------------------------------------------------------------------------------------------------------
 
-    pretraining_tof_h5 = "/SSD5_8TB/Yeon/data/merged_250916.h5"
+    pretraining_tof_h5 = "/SSD5_8TB/Yeon/data/merge_oasis_openneuro.h5"
     paired_tof_h5      = "/SSD5_8TB/Yeon/data/registered_all_subjects_m1to1.h5"
     # paired_tof_h5      = "/SSD5_8TB/Yeon/data/mgre_tof_m1to1_fast.h5"
     paired_mgre_h5     = paired_tof_h5  # ControlNet은 같은 파일에서 키만 다르게 읽음(워커당 I/O 1회)
@@ -52,15 +53,15 @@ def main():
     # -------- 입력/해상도 --------
     neighbors = 2                       # 위/아래 2장 → 총 5채널---------------------------------------------------------------------------------------------------------------------
     K = 2 * neighbors + 1               # 입력 채널 수
-    IMG_SIZE = 320
+    IMG_SIZE = 512
 
     # -------- 전처리 정책 --------
     RESCALE_MODE   = "none"             # "none" | "zero_one" | "neg_one_one"
     AUTO_NORMALIZE = False
 
     # -------- 결과 저장 --------
-    RESULTS_DIR_PRE  = "./results_cldm_stage1_5slices"#---------------------------------------------------------------------------------------------------------------------------------
-    RESULTS_DIR_CTRL = "./results_cldm_stage2_5slices_last_50_180"
+    RESULTS_DIR_PRE  = "./rlt_stage1_5slices_FOV512"#---------------------------------------------------------------------------------------------------------------------------------
+    RESULTS_DIR_CTRL = "./rlt_stage2_5slices"#---------------------------------------------------------------------------------------------------------------------------------
     # RESULTS_DIR_CTRL = "./results_cldm_stage2_5slices_last_80_150"
 
 
@@ -101,10 +102,10 @@ def main():
 
     # ==================== 6) Trainer 공통 학습 하이퍼파라미터 ====================
     common_trainer_kwargs = dict(
-        train_batch_size=5 * 1,              # 배치 크기------------------------------------------------------------------------------------------------------------------------------------------
+        train_batch_size=2,              # 배치 크기------------------------------------------------------------------------------------------------------------------------------------------ # 12 (FOV224), 8 (FOV320), 2 (FOV512)
         train_lr=8e-5,                       # 학습률
         train_num_steps=700000,              # 총 학습 스텝
-        gradient_accumulate_every=4,         # 그래디언트 누적---------------------------------------------------------------------------------------------------------------------------------
+        gradient_accumulate_every=9,         # 그래디언트 누적---------------------------------------------------------------------------------------------------------------------------------
         ema_decay=0.995,                     # EMA 감쇠
         amp=True,                            # 혼합정밀(AMP)
         calculate_fid=False,                 # FID 비계산
@@ -116,7 +117,7 @@ def main():
         rescale=RESCALE_MODE,                # 스케일링 정책
         seed=42,                             # 시드
         crop_size=(IMG_SIZE, IMG_SIZE),      # 크롭 사이즈
-        crop_mode_train="random",            # 학습: 랜덤 크롭
+        crop_mode_train="random",            # 학습: 랜덤 크롭``
         crop_mode_val="center",              # 검증: 센터 크롭
         augment_horizontal_flip=True,        # 수평 플립 증강
 
@@ -127,8 +128,8 @@ def main():
         test_subject_count = 1,
         eval_use_test_split=True,            # 테스트 DataLoader 생성·사용
         # ----------수정 2025-10-20 끝
-        z_start=50,
-        z_end=180, # 295
+        z_start=None,
+        z_end=None, # 295
         # z_start=80,
         # z_end=150, # 295
     )
@@ -217,13 +218,13 @@ def main():
 
 
     # ============================== 9) 학습 시작 ===============================
-    # trainer.train()
+    trainer.train()
 
     # ============================== 10) 평가 호출 ===============================
     # 학습 끝난 뒤, 밸리데이션 셋에서 샘플링/저장
     # trainer.sample_on_val(max_items=150)   # None이면 전체, 예시는 150개만
     # print("=== Sampling on Test sets ===")
-    trainer.sample_on_test(max_items=150)
+    trainer.sample_on_test(max_items=None)
 
 
 
